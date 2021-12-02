@@ -115,6 +115,9 @@ RMStream *ff_rm_alloc_rmstream (void)
 
 void ff_rm_free_rmstream (RMStream *rms)
 {
+    if (!rms)
+        return;
+
     av_packet_unref(&rms->pkt);
 }
 
@@ -124,6 +127,10 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
     char buf[256];
     uint32_t version;
     int ret;
+
+    // Duplicate tags
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO)
+        return AVERROR_INVALIDDATA;
 
     /* ra type header */
     version = avio_rb16(pb); /* version */
@@ -162,7 +169,11 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
         avio_rb16(pb); /* version2 */
         avio_rb32(pb); /* header size */
         flavor= avio_rb16(pb); /* add codec info / flavor */
-        ast->coded_framesize = coded_framesize = avio_rb32(pb); /* coded frame size */
+        coded_framesize = avio_rb32(pb); /* coded frame size */
+        if (coded_framesize < 0)
+            return AVERROR_INVALIDDATA;
+        ast->coded_framesize = coded_framesize;
+
         avio_rb32(pb); /* ??? */
         bytes_per_minute = avio_rb32(pb);
         if (version == 4) {
@@ -216,7 +227,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
                 if (version == 5)
                     avio_r8(pb);
                 codecdata_length = avio_rb32(pb);
-                if(codecdata_length + AV_INPUT_BUFFER_PADDING_SIZE <= (unsigned)codecdata_length){
+                if((unsigned)codecdata_length > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE){
                     av_log(s, AV_LOG_ERROR, "codecdata_length too large\n");
                     return -1;
                 }
@@ -247,7 +258,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
             if (version == 5)
                 avio_r8(pb);
             codecdata_length = avio_rb32(pb);
-            if(codecdata_length + AV_INPUT_BUFFER_PADDING_SIZE <= (unsigned)codecdata_length){
+            if((unsigned)codecdata_length > INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE){
                 av_log(s, AV_LOG_ERROR, "codecdata_length too large\n");
                 return -1;
             }
@@ -262,9 +273,9 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
         case DEINT_ID_INT4:
             if (ast->coded_framesize > ast->audio_framesize ||
                 sub_packet_h <= 1 ||
-                ast->coded_framesize * sub_packet_h > (2 + (sub_packet_h & 1)) * ast->audio_framesize)
+                ast->coded_framesize * (uint64_t)sub_packet_h > (2 + (sub_packet_h & 1)) * ast->audio_framesize)
                 return AVERROR_INVALIDDATA;
-            if (ast->coded_framesize * sub_packet_h != 2*ast->audio_framesize) {
+            if (ast->coded_framesize * (uint64_t)sub_packet_h != 2*ast->audio_framesize) {
                 avpriv_request_sample(s, "mismatching interleaver parameters");
                 return AVERROR_INVALIDDATA;
             }
@@ -289,7 +300,7 @@ static int rm_read_audio_stream_info(AVFormatContext *s, AVIOContext *pb,
             ast->deint_id == DEINT_ID_GENR ||
             ast->deint_id == DEINT_ID_SIPR) {
             if (st->codecpar->block_align <= 0 ||
-                ast->audio_framesize * sub_packet_h > (unsigned)INT_MAX ||
+                ast->audio_framesize * (uint64_t)sub_packet_h > (unsigned)INT_MAX ||
                 ast->audio_framesize * sub_packet_h < st->codecpar->block_align)
                 return AVERROR_INVALIDDATA;
             if (av_new_packet(&ast->pkt, ast->audio_framesize * sub_packet_h) < 0)
@@ -451,6 +462,8 @@ static int rm_read_index(AVFormatContext *s)
         }
 
         for (n = 0; n < n_pkts; n++) {
+            if (avio_feof(pb))
+                return AVERROR_INVALIDDATA;
             avio_skip(pb, 2);
             pts = avio_rb32(pb);
             pos = avio_rb32(pb);
@@ -538,7 +551,7 @@ static int rm_read_header(AVFormatContext *s)
     unsigned int data_off = 0, indx_off = 0;
     char buf[128], mime[128];
     int flags = 0;
-    int ret = -1;
+    int ret;
     unsigned size, v;
     int64_t codec_pos;
 
@@ -554,6 +567,7 @@ static int rm_read_header(AVFormatContext *s)
     avio_skip(pb, tag_size - 8);
 
     for(;;) {
+        ret = AVERROR_INVALIDDATA;
         if (avio_feof(pb))
             goto fail;
         tag = avio_rl32(pb);
@@ -619,8 +633,9 @@ static int rm_read_header(AVFormatContext *s)
                 avio_seek(pb, codec_pos + size, SEEK_SET);
             } else {
                 avio_skip(pb, -4);
-                if (ff_rm_read_mdpr_codecdata(s, s->pb, st, st->priv_data,
-                                              size, mime) < 0)
+                ret = ff_rm_read_mdpr_codecdata(s, s->pb, st, st->priv_data,
+                                                size, mime);
+                if (ret < 0)
                     goto fail;
             }
 
@@ -694,21 +709,23 @@ static int rm_sync(AVFormatContext *s, int64_t *timestamp, int *flags, int *stre
             state= (state<<8) + avio_r8(pb);
 
             if(state == MKBETAG('I', 'N', 'D', 'X')){
-                int n_pkts, expected_len;
+                int n_pkts;
+                int64_t expected_len;
                 len = avio_rb32(pb);
                 avio_skip(pb, 2);
                 n_pkts = avio_rb32(pb);
-                expected_len = 20 + n_pkts * 14;
-                if (len == 20)
+                expected_len = 20 + n_pkts * 14LL;
+
+                if (len == 20 && expected_len <= INT_MAX)
                     /* some files don't add index entries to chunk size... */
                     len = expected_len;
                 else if (len != expected_len)
                     av_log(s, AV_LOG_WARNING,
-                           "Index size %d (%d pkts) is wrong, should be %d.\n",
+                           "Index size %d (%d pkts) is wrong, should be %"PRId64".\n",
                            len, n_pkts, expected_len);
-                len -= 14; // we already read part of the index header
-                if(len<0)
+                if(len < 14)
                     continue;
+                len -= 14; // we already read part of the index header
                 goto skip;
             } else if (state == MKBETAG('D','A','T','A')) {
                 av_log(s, AV_LOG_WARNING,
@@ -998,8 +1015,8 @@ static int rm_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     RMDemuxContext *rm = s->priv_data;
     AVStream *st = NULL; // init to silence compiler warning
-    int i, len, res, seq = 1;
-    int64_t timestamp, pos;
+    int i, res, seq = 1;
+    int64_t timestamp, pos, len;
     int flags;
 
     for (;;) {
@@ -1018,7 +1035,9 @@ static int rm_read_packet(AVFormatContext *s, AVPacket *pkt)
                 ast = st->priv_data;
                 timestamp = AV_NOPTS_VALUE;
                 len = !ast->audio_framesize ? RAW_PACKET_SIZE :
-                    ast->coded_framesize * ast->sub_packet_h / 2;
+                    ast->coded_framesize * (int64_t)ast->sub_packet_h / 2;
+                if (len > INT_MAX)
+                    return AVERROR_INVALIDDATA;
                 flags = (seq++ == 1) ? 2 : 0;
                 pos = avio_tell(s->pb);
             } else {
@@ -1278,8 +1297,11 @@ static int ivr_read_header(AVFormatContext *s)
                 int j;
 
                 av_log(s, AV_LOG_DEBUG, "%s = '0x", key);
-                for (j = 0; j < len; j++)
+                for (j = 0; j < len; j++) {
+                    if (avio_feof(pb))
+                        return AVERROR_INVALIDDATA;
                     av_log(s, AV_LOG_DEBUG, "%X", avio_r8(pb));
+                }
                 av_log(s, AV_LOG_DEBUG, "'\n");
             } else if (len == 4 && type == 3 && !strncmp(key, "Duration", tlen)) {
                 st->duration = avio_rb32(pb);

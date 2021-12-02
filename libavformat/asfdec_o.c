@@ -245,6 +245,9 @@ static int asf_read_marker(AVFormatContext *s, const GUIDParseTable *g)
         avio_skip(pb, 4); // flags
         len = avio_rl32(pb);
 
+        if (avio_feof(pb))
+            return AVERROR_INVALIDDATA;
+
         if ((ret = avio_get_str16le(pb, len, name,
                                     sizeof(name))) < len)
             avio_skip(pb, len - ret);
@@ -357,7 +360,6 @@ static int asf_set_metadata(AVFormatContext *s, const uint8_t *name,
  * but in reality this is only loosely similar */
 static int asf_read_picture(AVFormatContext *s, int len)
 {
-    ASFContext *asf       = s->priv_data;
     AVPacket pkt          = { 0 };
     const CodecMime *mime = ff_id3v2_mime_tags;
     enum  AVCodecID id    = AV_CODEC_ID_NONE;
@@ -365,7 +367,6 @@ static int asf_read_picture(AVFormatContext *s, int len)
     uint8_t  *desc = NULL;
     AVStream   *st = NULL;
     int ret, type, picsize, desc_len;
-    ASFStream *asf_st;
 
     /* type + picsize + mime + desc */
     if (len < 1 + 4 + 2 + 2) {
@@ -422,21 +423,13 @@ static int asf_read_picture(AVFormatContext *s, int len)
         ret = AVERROR(ENOMEM);
         goto fail;
     }
-    asf->asf_st[asf->nb_streams] = av_mallocz(sizeof(*asf_st));
-    asf_st = asf->asf_st[asf->nb_streams];
-    if (!asf_st) {
-        ret = AVERROR(ENOMEM);
-        goto fail;
-    }
 
     st->disposition              |= AV_DISPOSITION_ATTACHED_PIC;
-    st->codecpar->codec_type      = asf_st->type = AVMEDIA_TYPE_VIDEO;
+    st->codecpar->codec_type      = AVMEDIA_TYPE_VIDEO;
     st->codecpar->codec_id        = id;
     st->attached_pic              = pkt;
-    st->attached_pic.stream_index = asf_st->index = st->index;
+    st->attached_pic.stream_index = st->index;
     st->attached_pic.flags       |= AV_PKT_FLAG_KEY;
-
-    asf->nb_streams++;
 
     if (*desc) {
         if (av_dict_set(&st->metadata, "title", desc, AV_DICT_DONT_STRDUP_VAL) < 0)
@@ -691,7 +684,7 @@ static int asf_read_properties(AVFormatContext *s, const GUIDParseTable *g)
     return 0;
 }
 
-static int parse_video_info(AVIOContext *pb, AVStream *st)
+static int parse_video_info(AVFormatContext *avfmt, AVIOContext *pb, AVStream *st)
 {
     uint16_t size_asf; // ASF-specific Format Data size
     uint32_t size_bmp; // BMP_HEADER-specific Format Data size
@@ -706,19 +699,10 @@ static int parse_video_info(AVIOContext *pb, AVStream *st)
     st->codecpar->codec_id  = ff_codec_get_id(ff_codec_bmp_tags, tag);
     size_bmp = FFMAX(size_asf, size_bmp);
 
-    if (size_bmp > BMP_HEADER_SIZE &&
-        size_bmp < INT_MAX - AV_INPUT_BUFFER_PADDING_SIZE) {
-        int ret;
-        st->codecpar->extradata_size  = size_bmp - BMP_HEADER_SIZE;
-        if (!(st->codecpar->extradata = av_malloc(st->codecpar->extradata_size +
-                                               AV_INPUT_BUFFER_PADDING_SIZE))) {
-            st->codecpar->extradata_size = 0;
-            return AVERROR(ENOMEM);
-        }
-        memset(st->codecpar->extradata + st->codecpar->extradata_size , 0,
-               AV_INPUT_BUFFER_PADDING_SIZE);
-        if ((ret = avio_read(pb, st->codecpar->extradata,
-                             st->codecpar->extradata_size)) < 0)
+    if (size_bmp > BMP_HEADER_SIZE) {
+        int ret = ff_get_extradata(avfmt, st->codecpar, pb, size_bmp - BMP_HEADER_SIZE);
+
+        if (ret < 0)
             return ret;
     }
     return 0;
@@ -799,7 +783,7 @@ static int asf_read_stream_properties(AVFormatContext *s, const GUIDParseTable *
         break;
     case AVMEDIA_TYPE_VIDEO:
         asf_st->type = AVMEDIA_TYPE_VIDEO;
-        if ((ret = parse_video_info(pb, st)) < 0)
+        if ((ret = parse_video_info(s, pb, st)) < 0)
             return ret;
         break;
     default:
@@ -1678,6 +1662,9 @@ static int detect_unknown_subobject(AVFormatContext *s, int64_t offset, int64_t 
     const GUIDParseTable *g = NULL;
     ff_asf_guid guid;
     int ret;
+
+    if (offset > INT64_MAX - size)
+        return AVERROR_INVALIDDATA;
 
     while (avio_tell(pb) <= offset + size) {
         if (avio_tell(pb) == asf->offset)
