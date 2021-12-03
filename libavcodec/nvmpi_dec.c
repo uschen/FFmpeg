@@ -15,8 +15,6 @@
 #include "libavutil/log.h"
 
 
-
-
 typedef struct {
 	char eos_reached;
 	nvmpictx* ctx;
@@ -39,28 +37,32 @@ static nvCodingType nvmpi_get_codingtype(AVCodecContext *avctx)
 
 static int nvmpi_init_decoder(AVCodecContext *avctx){
 
-	int ret=0;
-
 	nvmpiDecodeContext *nvmpi_context = avctx->priv_data;
 	nvCodingType codectype=NV_VIDEO_CodingUnused;
 
 	codectype =nvmpi_get_codingtype(avctx);
 	if (codectype == NV_VIDEO_CodingUnused) {
 		av_log(avctx, AV_LOG_ERROR, "Unknown codec type (%d).\n", avctx->codec_id);
-		ret = AVERROR_UNKNOWN;
-		return ret;
+		return AVERROR_UNKNOWN;
+	}
+
+	//Workaround for default pix_fmt not being set, so check if it isnt set and set it,
+   //or if it is set, but isnt set to something we can work with.
+
+	if(avctx->pix_fmt ==AV_PIX_FMT_NONE){
+		 avctx->pix_fmt=AV_PIX_FMT_YUV420P;
+	}else if(avctx-> pix_fmt != AV_PIX_FMT_YUV420P){
+		av_log(avctx, AV_LOG_ERROR, "Invalid Pix_FMT for NVMPI Only yuv420p is supported\n");
+		return AVERROR_INVALIDDATA;
 	}
 
 	nvmpi_context->ctx=nvmpi_create_decoder(codectype,NV_PIX_YUV420);
 
 	if(!nvmpi_context->ctx){
-		av_log(avctx, AV_LOG_ERROR, "Failed to nvmpi_create_decoder (code = %d).\n", ret);
-		ret = AVERROR_UNKNOWN;
-		return ret;
+		av_log(avctx, AV_LOG_ERROR, "Failed to nvmpi_create_decoder (code = %d).\n", AVERROR_EXTERNAL);
+		return AVERROR_EXTERNAL;
 	}
-
-	return ret;
-
+   return 0;
 }
 
 

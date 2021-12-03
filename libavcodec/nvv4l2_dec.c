@@ -824,9 +824,9 @@ static void *capture_thread(void *arg)
             }
         }
         /* Main Capture loop for DQ and Q. */
-
+        /* see: https://forums.developer.nvidia.com/t/jetson-nano-included-ffmpeg-package-segmentation-fault-no-matter-the-decoder-no-matter-the-file/171012/17 */
+        int buf_index;
         while (!ctx->eos) {
-            int buf_index;
             struct v4l2_buffer v4l2_buf;
             struct v4l2_plane planes[MAX_PLANES];
             NvBufferRect src_rect, dest_rect;
